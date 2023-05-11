@@ -1,7 +1,7 @@
 I've done quite a bit of work on this project, but it's still not where I'd like it to be. What I've done:
 
  - fix `cd` to file bug
- - modify `cd` to work on large directories
+ - modify `ls` to work on large directories
  - implement `cat`, including large directories
  - implement `append` (only for small files)
 
