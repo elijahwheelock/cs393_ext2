@@ -489,7 +489,7 @@ fn main() -> Result<()> {
                 let n_ptrs_in_block = ext2.block_size / mem::size_of::<u32>();
                 let (block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
                 let mut current_byte = 0;
-                if block_num < 12 {
+                while current_byte < b.len() && block_num < 12 {
                     if inode.direct_pointer[block_num] == 0 {
                         unsafe {
                             let p = alloc_zeroed(Layout::array::<u8>(ext2.block_size).unwrap());
@@ -512,6 +512,7 @@ fn main() -> Result<()> {
                             current_byte += 1;
                             byte_offset += 1;
                         }
+                        block_num += 1;
                     }
                 }
             }
