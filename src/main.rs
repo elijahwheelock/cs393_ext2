@@ -10,14 +10,25 @@ use crate::structs::{
     Superblock,
     TypePerm,
 };
-use core::cmp::min;
-use core::mem::size_of;
-// use core::ops::{Generator, GeneratorState};
+use core::{
+    mem,
+    ops::{Generator, GeneratorState},
+    pin::Pin,
+};
 use null_terminated::NulStr;
 use rustyline::{DefaultEditor, Result};
-use std::fmt;
-use std::io::{Error, ErrorKind::*};
-use std::mem;
+use std::{
+    alloc::{
+        alloc_zeroed,
+        Layout,   
+    },
+    fmt,   
+    fs::File,
+    io::{Error,
+         ErrorKind::*,
+         prelude::*,
+    },
+};
 use uuid::Uuid;
 use zerocopy::ByteSlice;
 
@@ -26,7 +37,7 @@ use zerocopy::ByteSlice;
 pub struct Ext2 {
     pub superblock: &'static Superblock,
     pub block_groups: &'static [BlockGroupDescriptor],
-    pub blocks: Vec<&'static [u8]>,
+    pub blocks: Vec<&'static mut [u8]>,
     pub block_size: usize,
     pub uuid: Uuid,
     pub block_offset: usize, // <- our "device data" actually starts at the block_offset'th block of the device so we have to subtract this number before indexing blocks[]
@@ -67,7 +78,7 @@ impl Ext2 {
         );
         let block_groups_rest_bytes = header_body_bytes.1.split_at(block_size);
         let block_groups = unsafe {
-            std::slice::from_raw_parts(
+            core::slice::from_raw_parts(
                 block_groups_rest_bytes.0.as_ptr() as *const BlockGroupDescriptor,
                 block_group_count,
             )
@@ -75,12 +86,12 @@ impl Ext2 {
         println!("block group 0: {:?}", block_groups[0]);
 
         let blocks = unsafe {
-            std::slice::from_raw_parts(
-                block_groups_rest_bytes.1.as_ptr() as *const u8,
+            core::slice::from_raw_parts_mut(
+                block_groups_rest_bytes.1.as_ptr() as *mut u8,
                 // would rather use: device_bytes.as_ptr(),
                 superblock.blocks_count as usize * block_size,
             )
-        }.chunks(block_size)
+        }.chunks_mut(block_size)
          .collect::<Vec<_>>();
         let offset_bytes = (blocks[0].as_ptr() as usize) - start_addr;
         let block_offset = offset_bytes / block_size;
@@ -95,93 +106,121 @@ impl Ext2 {
         }
     }
 
-    pub unsafe fn get_block(&self, inode_num: usize, offset: usize) -> *mut u8 {
-        todo!()
-    }
+    pub fn get_blocks_gen(&self, inode_num: usize)
+    -> GeneratorIteratorAdapter<impl Generator<Yield = *const u8, Return = ()> + '_>
+    {
+        GeneratorIteratorAdapter::new(
+            move || {
+                let inode = self.get_inode(inode_num);
+                let mut block_num = 0;
+                let n_ptrs_in_block = (self.block_size / mem::size_of::<u32>()) as isize;
+                while block_num < 12 {
+                    // direct pointers
+                    // println!("{:?}", inode);
+                    if inode.direct_pointer[block_num as usize] == 0 {
+                        return;
+                    }
+                    let block = 
+                        self.blocks[inode.direct_pointer[block_num as usize] as usize
+                                    - self.block_offset
+                                   ].as_ptr() as *const u8;
+                    if block == std::ptr::null() {
+                        return;
+                    }
+                    yield block;
+                    block_num += 1;
+                }
 
-    pub unsafe fn get_blocks(&self, inode_num: usize, offset: usize) -> Vec<*mut u8> {
-        // Returns a Vec of all the blocks containing data in `inode` from 0 to `offset`
-        //
-        // I wanted to make this return an iterator but it was way too much rustiness
-        // for way too little reward, so for now it just returns a Vec.
-        let mut ret = Vec::new();
-        let inode   = self.get_inode(inode_num);
-        let offset  = min(offset, inode.size());
-        let mut block_number = 0;
-        let last_block =
-            if offset % self.block_size == 0 {
-                offset as isize / self.block_size as isize
-            }
-            else {
-                offset as isize / self.block_size as isize + 1
-            };
-        let n_ptrs_in_block = (self.block_size / size_of::<u32>()) as isize;
-
-        while block_number < 12 && block_number < last_block {
-            // direct pointers
-            let direct_pointer =
-                self.blocks[inode.direct_pointer[block_number as usize] as usize
-                            - self.block_offset
-                           ].as_ptr() as *mut u8;
-            ret.push(direct_pointer);
-            block_number += 1;
-        }
-
-        let max_indirect = 12 + n_ptrs_in_block;
-        while block_number < max_indirect && block_number < last_block {
-            // indirect pointers
-            let indirect_pointer = self.blocks[inode.indirect_pointer as usize - self.block_offset].as_ptr();
-            for direct_block in 0..n_ptrs_in_block {
-                let direct_pointer =
-                    self.blocks[*indirect_pointer.offset(direct_block) as usize 
-                                - self.block_offset
-                                ].as_ptr() as *mut u8;
-                ret.push(direct_pointer);
-                block_number += 1;
-            }
-        }
-
-        let max_doubly_indirect = max_indirect + n_ptrs_in_block * n_ptrs_in_block as isize;
-        while block_number < max_doubly_indirect && block_number < last_block {
-            // doubly indirect pointers
-            let doubly_indirect = self.blocks[inode.doubly_indirect as usize - self.block_offset].as_ptr();
-            for ind_block in 0..n_ptrs_in_block {
-                let indirect_pointer =
-                    self.blocks[*doubly_indirect.offset(ind_block) as usize - self.block_offset].as_ptr();
+                // indirect pointers
+                let indirect_pointer = self.blocks[inode.indirect_pointer as usize - self.block_offset].as_ptr();
+                if indirect_pointer == std::ptr::null() {
+                    return;
+                }
                 for direct_block in 0..n_ptrs_in_block {
-                    let direct_pointer =
+                    let block = unsafe {
+                        if *indirect_pointer.offset(direct_block) == 0 {
+                            return;
+                        }
                         self.blocks[*indirect_pointer.offset(direct_block) as usize 
                                     - self.block_offset
-                                   ].as_ptr() as *mut u8;
-                    ret.push(direct_pointer);
-                    block_number += 1;
+                                   ].as_ptr() as *const u8
+                    };
+                    if block == std::ptr::null() {
+                        return;
+                    }
+                    yield block;
+                    block_num += 1;
                 }
-            }
-        }
 
-        let max_triply_indirect = max_doubly_indirect + n_ptrs_in_block * n_ptrs_in_block * n_ptrs_in_block as isize;
-        while block_number < max_triply_indirect && block_number < last_block {
-            // triply indirect pointers
-            let triply_indirect = self.blocks[inode.triply_indirect as usize - self.block_offset].as_ptr();
-            for double_block in 0..n_ptrs_in_block {
-                let doubly_indirect = self.blocks[*triply_indirect.offset(double_block) as usize 
-                                                  - self.block_offset
-                                                 ].as_ptr();
+                // doubly indirect pointers
+                let doubly_indirect = self.blocks[inode.doubly_indirect as usize - self.block_offset].as_ptr();
+                if doubly_indirect == std::ptr::null() {
+                    return;
+                }
                 for ind_block in 0..n_ptrs_in_block {
-                    let indirect_pointer =
-                        self.blocks[*doubly_indirect.offset(ind_block) as usize - self.block_offset].as_ptr();
+                    let indirect_pointer = unsafe {
+                        if *doubly_indirect.offset(ind_block) == 0 {
+                            return;
+                        }
+                        self.blocks[*doubly_indirect.offset(ind_block) as usize - self.block_offset].as_ptr()
+                    };
+                    if indirect_pointer == std::ptr::null() {
+                        return;
+                    }
                     for direct_block in 0..n_ptrs_in_block {
-                        let direct_pointer =
+                        let block = unsafe{
                             self.blocks[*indirect_pointer.offset(direct_block) as usize 
                                         - self.block_offset
-                                    ].as_ptr() as *mut u8;
-                        ret.push(direct_pointer);
-                        block_number += 1;
+                                        ].as_ptr() as *const u8
+                        };
+                        if block == std::ptr::null() {
+                            return;
+                        }
+                        yield block;
+                        block_num += 1;
+                    }
+                }
+
+                // triply indirect pointers
+                let triply_indirect = self.blocks[inode.triply_indirect as usize - self.block_offset].as_ptr();
+                if triply_indirect == std::ptr::null() {
+                    return;
+                }
+                for double_block in 0..n_ptrs_in_block {
+                    let doubly_indirect = unsafe {
+                        if *triply_indirect.offset(double_block) == 0 {
+                            return;
+                        }
+                        self.blocks[*triply_indirect.offset(double_block) as usize 
+                                    - self.block_offset
+                                ].as_ptr()
+                    };
+                    if doubly_indirect == std::ptr::null() {
+                        return;
+                    }
+                    for ind_block in 0..n_ptrs_in_block {
+                        let indirect_pointer = unsafe {
+                            self.blocks[*doubly_indirect.offset(ind_block) as usize - self.block_offset].as_ptr()
+                        };
+                        if indirect_pointer == std::ptr::null() {
+                            return;
+                        }
+                        for direct_block in 0..n_ptrs_in_block {
+                            let block = unsafe {
+                                self.blocks[*indirect_pointer.offset(direct_block) as usize 
+                                            - self.block_offset
+                                        ].as_ptr() as *const u8
+                            };
+                            if block == std::ptr::null() {
+                                return;
+                            }
+                            yield block;
+                            block_num += 1;
+                        }
                     }
                 }
             }
-        }
-        ret
+        )
     }
 
     pub fn get_child_by_name(&self, inode: usize, name: &String)
@@ -221,15 +260,15 @@ impl Ext2 {
     }
 
     // given a (1-indexed) inode number, return that #'s inode structure
-    pub fn get_inode(&self, inode: usize) -> &Inode {
+    pub fn get_inode(&self, inode: usize) -> &mut Inode {
         let group: usize = (inode - 1) / self.superblock.inodes_per_group as usize;
         let index: usize = (inode - 1) % self.superblock.inodes_per_group as usize;
         // println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
         let inode_table_block = (self.block_groups[group].inode_table_block) as usize - self.block_offset;
         // println!("in get_inode, block number of inode table {}", inode_table_block);
         let inode_table = unsafe {
-            std::slice::from_raw_parts(
-                self.blocks[inode_table_block].as_ptr() as *const Inode,
+            core::slice::from_raw_parts_mut(
+                self.blocks[inode_table_block].as_ptr() as *mut Inode,
                 self.superblock.inodes_per_group as usize,
             )
         };
@@ -237,7 +276,7 @@ impl Ext2 {
         // so we don't have to slice each time,
         // but this works for now.
         // println!("{:?}", inode_table);
-        &inode_table[index]
+        &mut inode_table[index]
     }
 
     pub fn is_directory(&self, inode: usize) -> bool {
@@ -248,13 +287,9 @@ impl Ext2 {
     -> std::io::Result<Vec<(usize, &NulStr)>>
     {
         let mut ret = Vec::new();
-        let root = self.get_inode(inode);
         // println!("in read_dir_inode, #{} : {:?}", inode, root);
         // println!("following direct pointer to data block: {}", root.direct_pointer[0]);
-        let entry_ptr = self.blocks[root.direct_pointer[0] as usize - self.block_offset].as_ptr();
-        let blocks = unsafe {
-            self.get_blocks(inode, root.size())
-        };
+        let blocks = self.get_blocks_gen(inode);
         for block in blocks {
             let mut byte_offset: isize = 0;
             while byte_offset < (self.block_size as isize) {
@@ -294,10 +329,41 @@ impl fmt::Debug for Inode {
     }
 }
 
+// the following copied from 
+// https://stackoverflow.com/questions/16421033/lazy-sequence-generation-in-rust#30279122
+pub struct GeneratorIteratorAdapter<G>(Pin<Box<G>>);
+
+impl<G> GeneratorIteratorAdapter<G>
+where
+    G: Generator<Return = ()>,
+{
+    fn new(gen: G) -> Self {
+        Self(Box::pin(gen))
+    }
+}
+
+impl<G> Iterator for GeneratorIteratorAdapter<G>
+where
+    G: Generator<Return = ()>,
+{
+    type Item = G::Yield;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.0.as_mut().resume(()) {
+            GeneratorState::Yielded(x) => Some(x),
+            GeneratorState::Complete(_) => None,
+        }
+    }
+}
+
 fn main() -> Result<()> {
-    let disk = include_bytes!("../myfs.ext2");
-    let start_addr: usize = disk.as_ptr() as usize;
-    let ext2 = Ext2::new(&disk[..], start_addr);
+    //let mut disk = include_bytes!("../myfs.ext2");
+    let mut file = File::open("../myfs.ext2").unwrap();
+    let mut v = Vec::new();
+    file.read_to_end(&mut v);
+    let buf = v.as_mut_slice();
+    let start_addr: usize = buf.as_ptr() as usize;
+    let mut ext2 = Ext2::new(&buf[..], start_addr);
     let mut current_inode: usize = 2;
     let mut rl = DefaultEditor::new()?;
     loop {
@@ -393,10 +459,9 @@ fn main() -> Result<()> {
                     }
                 };
                 if !ext2.is_directory(inode_num) {
-                    let inode = ext2.get_inode(inode_num);
                     unsafe {
-                        let blocks = ext2.get_blocks(inode_num, inode.size());
-                        for block in blocks {
+                        let blocks_gen = ext2.get_blocks_gen(inode_num);
+                        for block in blocks_gen {
                             for i in 0..ext2.block_size as isize {
                                 print!("{}", *block.offset(i) as char);
                             }
@@ -409,8 +474,6 @@ fn main() -> Result<()> {
             }
 
             else if cmd == &"append" {
-                println!("append not yet implemented");
-                continue;
                 let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
                     Ok(inode) => inode,
                     Err(e) => {
@@ -418,8 +481,39 @@ fn main() -> Result<()> {
                         continue;
                     }
                 };
-                let inode = ext2.get_inode(inode_num);
-                let bytes_to_read = inode.size();
+                let s = args[1..].join("");
+                let b = s.as_bytes();
+                b.push(10);
+                let inode: &mut Inode = ext2.get_inode(inode_num);
+                let size = inode.size();
+                let n_ptrs_in_block = ext2.block_size / mem::size_of::<u32>();
+                let (block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
+                let mut current_byte = 0;
+                if block_num < 12 {
+                    if inode.direct_pointer[block_num] == 0 {
+                        unsafe {
+                            let p = alloc_zeroed(Layout::array::<u8>(ext2.block_size).unwrap());
+                            let slice = core::slice::from_raw_parts_mut(p, ext2.block_size);
+                            inode.direct_pointer[block_num] = ext2.blocks.len() as u32;
+                            ext2.blocks.push(slice);
+                            // TODO possibly need to make a new block group, but the given definition for the Ext2
+                            //      struct doesn't allow adding block groups, so I'm assuming that's outside the scope
+                            //      of this project.
+                        }
+                    }
+                    else {
+                        let tmp = inode.direct_pointer[block_num] as usize;
+                        let current_block = &mut ext2.blocks[tmp - ext2.block_offset];
+                        if byte_offset > 0 {
+                            byte_offset -= 1
+                        }
+                        while current_byte < b.len() && byte_offset < ext2.block_size {
+                            current_block[byte_offset] = b[current_byte];
+                            current_byte += 1;
+                            byte_offset += 1;
+                        }
+                    }
+                }
             }
 
             else if line.starts_with("rm") {
