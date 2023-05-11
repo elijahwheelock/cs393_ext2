@@ -260,7 +260,7 @@ impl Ext2 {
     }
 
     // given a (1-indexed) inode number, return that #'s inode structure
-    pub fn get_inode(&self, inode: usize) -> &mut Inode {
+    pub fn get_inode(&self, inode: usize) -> &'static mut Inode { // FIXME this kills the borrow checker
         let group: usize = (inode - 1) / self.superblock.inodes_per_group as usize;
         let index: usize = (inode - 1) % self.superblock.inodes_per_group as usize;
         // println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
@@ -312,22 +312,22 @@ impl Inode {
     }
 }
 
-impl fmt::Debug for Inode {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.size_low == 0 && self.size_high == 0 {
-            f.debug_struct("").finish()
-        } else {
-            f.debug_struct("Inode")
-             .field("type_perm", &self.type_perm)
-             .field("size_low", &self.size_low)
-             .field("size_high", &self.size_low)
-             .field("size", &self.size())
-             .field("direct_pointers", &self.direct_pointer)
-             .field("indirect_pointer", &self.indirect_pointer)
-             .finish()
-        }
-    }
-}
+// impl fmt::Debug for Inode {
+//     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+//         if self.size_low == 0 && self.size_high == 0 {
+//             f.debug_struct("").finish()
+//         } else {
+//             f.debug_struct("Inode")
+//              .field("type_perm", &self.type_perm)
+//              .field("size_low", &self.size_low)
+//              .field("size_high", &self.size_low)
+//              .field("size", &self.size())
+//              .field("direct_pointers", &self.direct_pointer)
+//              .field("indirect_pointer", &self.indirect_pointer)
+//              .finish()
+//         }
+//     }
+// }
 
 // the following copied from 
 // https://stackoverflow.com/questions/16421033/lazy-sequence-generation-in-rust#30279122
@@ -384,7 +384,114 @@ fn main() -> Result<()> {
                 None              => continue,
             };
 
-            if cmd == &"ls" {
+            if cmd == &"append" {
+                let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
+                    Ok(inode) => inode,
+                    Err(e) => {
+                        println!("{:?}", e);
+                        continue;
+                    }
+                };
+                let s = args[1..].join("") + "\x0a"; // + EOF
+                let b = s.as_bytes();
+                let inode: &mut Inode = ext2.get_inode(inode_num);
+                let size = inode.size();
+                let n_ptrs_in_block = ext2.block_size / mem::size_of::<u32>();
+                let (mut block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
+                let mut current_byte = 0;
+                let tmp = inode.direct_pointer[block_num] as usize;
+                while current_byte < b.len() && block_num < 12 {
+                    if tmp == 0 {
+                        unsafe {
+                            let p = alloc_zeroed(Layout::array::<u8>(ext2.block_size).unwrap());
+                            let slice = core::slice::from_raw_parts_mut(p, ext2.block_size);
+                            *inode.direct_pointer.as_mut_ptr().offset(block_num as isize) = ext2.blocks.len() as u32;
+                            ext2.blocks.push(slice);
+                            // TODO possibly need to make a new block group, but the given definition for the Ext2
+                            //      struct doesn't allow adding block groups, for now so I'm assuming that's outside
+                            //      the scope of this project.
+                        }
+                    }
+                    else {
+                        let current_block = &mut ext2.blocks[tmp - ext2.block_offset];
+                        if byte_offset > 0 {
+                            byte_offset -= 1
+                        }
+                        while current_byte < b.len() && byte_offset < ext2.block_size {
+                            current_block[byte_offset] = b[current_byte];
+                            current_byte += 1;
+                            byte_offset += 1;
+                        }
+                        block_num += 1;
+                    }
+                }
+            }
+
+            else if cmd == &"cat" {
+                // `cat filename`
+                // print the contents of filename to stdout
+                // if it's a directory, print a nice error
+                let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
+                    Ok(inode_num) => inode_num,
+                    Err(e) => {
+                        println!("{:?}", e);
+                        continue;
+                    }
+                };
+                if !ext2.is_directory(inode_num) {
+                    unsafe {
+                        let blocks_gen = ext2.get_blocks_gen(inode_num);
+                        for block in blocks_gen {
+                            for i in 0..ext2.block_size as isize {
+                                print!("{}", *block.offset(i) as char);
+                            }
+                        }
+                    };
+                }
+                else {
+                    println!("is a directory: {}", args[0]);
+                }
+            }
+
+            else if cmd == &"cd" {
+                // `cd` with no arguments goes back to root
+                // `cd path` moves cwd to that path
+                if args.len() == 0 {
+                    current_inode = 2;
+                } else {
+                    let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
+                        Ok(inode) => inode,
+                        Err(e) => {
+                            println!("{:?}", e);
+                            continue;
+                        }
+                    };
+                    if ext2.is_directory(inode_num) {
+                        current_inode = inode_num;
+                    }
+                    else {
+                        println!("not a directory: {}", args[0]);
+                    }
+                }
+            }
+
+            else if cmd == &"inspect" {
+                let inode_num =
+                    if args.len() == 0 {
+                        current_inode
+                    } else {
+                        match ext2.get_child_by_path(current_inode, args[0]) {
+                            Ok(inode) => inode,
+                            Err(e) => {
+                                println!("{:?}", e);
+                                continue;
+                            }
+                        }
+                    };
+                println!("{:?}", ext2.get_inode(inode_num));
+            }
+
+            else if cmd == &"ls" {
                 // `ls` prints our cwd's children
                 let inode_num =
                     if args.len() >= 1 {
@@ -418,26 +525,12 @@ fn main() -> Result<()> {
                 }
             }
 
-            else if cmd == &"cd" {
-                // `cd` with no arguments goes back to root
-                // `cd path` moves cwd to that path
-                if args.len() == 0 {
-                    current_inode = 2;
-                } else {
-                    let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
-                        Ok(inode) => inode,
-                        Err(e) => {
-                            println!("{:?}", e);
-                            continue;
-                        }
-                    };
-                    if ext2.is_directory(inode_num) {
-                        current_inode = inode_num;
-                    }
-                    else {
-                        println!("not a directory: {}", args[0]);
-                    }
-                }
+            else if line.starts_with("link") {
+                // `link arg_1 arg_2`
+                // create a hard link from arg_1 to arg_2
+                // consider what to do if arg2 does- or does-not end in "/"
+                // and/or if arg2 is an existing directory name
+                println!("link not yet implemented");
             }
 
             else if line.starts_with("mkdir") {
@@ -447,94 +540,16 @@ fn main() -> Result<()> {
                 println!("mkdir not yet implemented");
              }
 
-            else if cmd == &"cat" {
-                // `cat filename`
-                // print the contents of filename to stdout
-                // if it's a directory, print a nice error
-                let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
-                    Ok(inode_num) => inode_num,
-                    Err(e) => {
-                        println!("{:?}", e);
-                        continue;
-                    }
-                };
-                if !ext2.is_directory(inode_num) {
-                    unsafe {
-                        let blocks_gen = ext2.get_blocks_gen(inode_num);
-                        for block in blocks_gen {
-                            for i in 0..ext2.block_size as isize {
-                                print!("{}", *block.offset(i) as char);
-                            }
-                        }
-                    };
-                }
-                else {
-                    println!("is a directory: {}", args[0]);
-                }
-            }
-
-            else if cmd == &"append" {
-                let inode_num = match ext2.get_child_by_path(current_inode, args[0]) {
-                    Ok(inode) => inode,
-                    Err(e) => {
-                        println!("{:?}", e);
-                        continue;
-                    }
-                };
-                let s = args[1..].join("");
-                let b = s.as_bytes();
-                b.push(10);
-                let inode: &mut Inode = ext2.get_inode(inode_num);
-                let size = inode.size();
-                let n_ptrs_in_block = ext2.block_size / mem::size_of::<u32>();
-                let (block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
-                let mut current_byte = 0;
-                while current_byte < b.len() && block_num < 12 {
-                    if inode.direct_pointer[block_num] == 0 {
-                        unsafe {
-                            let p = alloc_zeroed(Layout::array::<u8>(ext2.block_size).unwrap());
-                            let slice = core::slice::from_raw_parts_mut(p, ext2.block_size);
-                            inode.direct_pointer[block_num] = ext2.blocks.len() as u32;
-                            ext2.blocks.push(slice);
-                            // TODO possibly need to make a new block group, but the given definition for the Ext2
-                            //      struct doesn't allow adding block groups, so I'm assuming that's outside the scope
-                            //      of this project.
-                        }
-                    }
-                    else {
-                        let tmp = inode.direct_pointer[block_num] as usize;
-                        let current_block = &mut ext2.blocks[tmp - ext2.block_offset];
-                        if byte_offset > 0 {
-                            byte_offset -= 1
-                        }
-                        while current_byte < b.len() && byte_offset < ext2.block_size {
-                            current_block[byte_offset] = b[current_byte];
-                            current_byte += 1;
-                            byte_offset += 1;
-                        }
-                        block_num += 1;
-                    }
-                }
-            }
-
-            else if line.starts_with("rm") {
-                // `rm target`
-                // unlink a file or empty directory
-                println!("rm not yet implemented");
-            }
-
             else if line.starts_with("mount") {
                 // `mount host_filename mountpoint`
                 // mount an ext2 filesystem over an existing empty directory
                 println!("mount not yet implemented");
             }
 
-            else if line.starts_with("link") {
-                // `link arg_1 arg_2`
-                // create a hard link from arg_1 to arg_2
-                // consider what to do if arg2 does- or does-not end in "/"
-                // and/or if arg2 is an existing directory name
-                println!("link not yet implemented");
+            else if line.starts_with("rm") {
+                // `rm target`
+                // unlink a file or empty directory
+                println!("rm not yet implemented");
             }
 
             else if line.starts_with("quit") || line.starts_with("exit") {

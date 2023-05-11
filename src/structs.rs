@@ -127,6 +127,7 @@ pub struct BlockGroupDescriptor {
 }
 
 #[repr(C)]
+#[derive(Debug)]
 pub struct Inode {
     /// Type and Permissions (see below)
     pub type_perm: TypePerm,
