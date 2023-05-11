@@ -1,6 +1,7 @@
 /target
 .vscode/settings.json
 .direnv
+Cargo.lock
 
 # Added by cargo
 #
