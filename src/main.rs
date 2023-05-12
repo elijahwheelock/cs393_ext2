@@ -303,7 +303,9 @@ impl Ext2 {
     }
 
     // given a (1-indexed) inode number, return that #'s inode structure
-    pub fn get_inode(&self, inode: usize) -> &'static mut Inode { // FIXME I'm fighting the borrow checker here, and losing
+    pub fn get_inode(&self, inode: usize) -> &'static mut Inode {
+                                          // FIXME I'm fighting the borrow checker here, and losing
+                                          //       I think I need to get used to mostly only passing usizes
         let group: usize = (inode - 1) / self.superblock.inodes_per_group as usize;
         let index: usize = (inode - 1) % self.superblock.inodes_per_group as usize;
         // println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
@@ -324,6 +326,20 @@ impl Ext2 {
 
     pub fn is_directory(&self, inode: usize) -> bool {
         self.get_inode(inode).type_perm.contains(TypePerm::DIRECTORY)
+    }
+
+    pub fn mark_block_used(&mut self, block_num: usize) {
+        let group: usize = (block_num - 1) / self.superblock.blocks_per_group as usize;
+        let index: usize = (block_num - 1) % self.superblock.blocks_per_group as usize;
+        let block_usage_bitmap = &mut self.blocks[self.block_groups[group].block_usage_addr as usize - self.block_offset];
+        block_usage_bitmap[index / 8] |= 1 << (index % 8);
+    }
+
+    pub fn mark_inode_used(&mut self, inode_num: usize) {
+        let group: usize = (inode_num - 1) / self.superblock.inodes_per_group as usize;
+        let index: usize = (inode_num - 1) % self.superblock.inodes_per_group as usize;
+        let inode_usage_bitmap = &mut self.blocks[self.block_groups[group].inode_usage_addr as usize - self.block_offset];
+        inode_usage_bitmap[index / 8] |= 1 << (index % 8);
     }
 
     pub fn read_dir_inode(&self, inode: usize)
@@ -440,7 +456,6 @@ fn main() -> Result<()> {
                 let (mut block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
                 let mut current_byte = 0;
                 while current_byte < b.len() && block_num < 12 {
-                    let tmp = inode.direct_pointer[block_num] as usize;
                     if inode.direct_pointer[block_num] as usize == 0 {
                         let new_block_num = ext2.get_free_block_num();
                         inode.direct_pointer[block_num] = new_block_num.unwrap() as u32;
@@ -558,6 +573,42 @@ fn main() -> Result<()> {
                 }
             }
 
+            if cmd == &"touch" {
+                let target = args[0];
+                match ext2.get_child_by_name(current_inode, &target.to_string()) {
+                    Ok(_) => continue,
+                    Err(_)  => (),
+                };
+                let inode: &mut Inode = ext2.get_inode(current_inode);
+                let new_inode_num = ext2.get_free_inode_num().unwrap();
+                ext2.mark_inode_used(new_inode_num);
+                let size = inode.size();
+                let n_ptrs_in_block = ext2.block_size / mem::size_of::<u32>();
+                let (mut block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
+                while block_num < 12 {
+                    if inode.direct_pointer[block_num] as usize == 0 {
+                        let new_block_num = ext2.get_free_block_num();
+                        inode.direct_pointer[block_num] = new_block_num.unwrap() as u32;
+                        byte_offset = 0;
+                    }
+                    else if ext2.block_size < byte_offset + mem::size_of::<Inode>() {
+                        block_num += 1;
+                        byte_offset = 0;
+                    } else {
+                        let current_block = &mut ext2.blocks[inode.direct_pointer[block_num] as usize - ext2.block_offset];
+                        let new_inode = Inode::new();
+                        let bytes = unsafe {
+                            //core::slice::from_raw_parts(&new_inode as *const u8, mem::size_of::<Inode>())
+                            core::mem::transmute::<Inode, [u8; 256]>(new_inode)
+                        };
+                        for b in bytes {
+                            current_block[byte_offset] = b;
+                            byte_offset += 1;
+                        }
+                    }
+                }
+            }
+
             else if line.starts_with("link") {
                 // `link arg_1 arg_2`
                 // create a hard link from arg_1 to arg_2
@@ -565,30 +616,25 @@ fn main() -> Result<()> {
                 // and/or if arg2 is an existing directory name
                 println!("link not yet implemented");
             }
-
             else if line.starts_with("mkdir") {
                 // `mkdir childname`
                 // create a directory with the given name, add a link to cwd
                 // consider supporting `-p path/to_file` to create a path of directories
                 println!("mkdir not yet implemented");
              }
-
             else if line.starts_with("mount") {
                 // `mount host_filename mountpoint`
                 // mount an ext2 filesystem over an existing empty directory
                 println!("mount not yet implemented");
             }
-
             else if line.starts_with("rm") {
                 // `rm target`
                 // unlink a file or empty directory
                 println!("rm not yet implemented");
             }
-
             else if line.starts_with("quit") || line.starts_with("exit") {
                 break;
             }
-
         } else {
             println!("bye!");
             break;

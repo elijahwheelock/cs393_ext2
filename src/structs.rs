@@ -122,7 +122,6 @@ pub struct BlockGroupDescriptor {
     pub free_inodes_count: u16,
     /// Number of directories in group
     pub dirs_count: u16,
-
     _reserved: [u8; 14],
 }
 
@@ -181,6 +180,35 @@ pub struct Inode {
     /// Operating System Specific Value #2
     pub _os_specific_2: [u8; 12],
     _padding: [u8; 128], // TODO: handle inode sizes != 128 according to superblock
+}
+
+impl Inode {
+    pub fn new() -> Self {
+        Inode {
+            type_perm: TypePerm::FILE|TypePerm::O_EXEC|TypePerm::O_WRITE|TypePerm::O_READ,
+            uid: 0  ,                 // User ID
+            size_low: 0,              // Lower 32 bits of size in bytes
+            atime: 0,                 // Last Access Time (in POSIX time)
+            ctime: 0,                 // Creation Time (in POSIX time)
+            mtime: 0,                 // Last Modification time (in POSIX time)
+            dtime: 0,                 // Deletion time (in POSIX time)
+            gid: 0,                   // Group ID
+            hard_links: 0,            // Count of hard links (directory entries) to this inode. When this reaches 0, the data blocks are marked as unallocated.
+            sectors_count: 0,         // Count of disk sectors (not Ext2 blocks) in use by this inode, not counting the actual inode structure nor directory entries linking to the inode.
+            flags: 0,                 // Flags
+            _os_specific_1: [0; 4],   // Operating System Specific value #1
+            direct_pointer: [0; 12],  // Direct block pointers
+            indirect_pointer: 0,      // Singly Indirect Block Pointer (Points to a block that is a list of block pointers to data)
+            doubly_indirect: 0,       // Doubly Indirect Block Pointer (Points to a block that is a list of block pointers to Singly Indirect Blocks)
+            triply_indirect: 0,       // Triply Indirect Block Pointer (Points to a block that is a list of block pointers to Doubly Indirect Blocks)
+            gen_number: 0,            // Generation number (Primarily used for NFS)
+            ext_attribute_block: 0,   // In Ext2 version 0, this field is reserved. In version >= 1, Extended attribute block (File ACL).
+            size_high: 0,             // In Ext2 version 0, this field is reserved. In version >= 1, Upper 32 bits of file size (if feature bit set) if it's a file, Directory ACL if it's a directory
+            frag_block_addr: 0,       // Block address of fragment
+            _os_specific_2: [0; 12],  // Operating System Specific Value #2
+            _padding: [0; 128], // TODO: handle inode sizes != 128 according to superblock
+        }
+    }
 }
 
 #[repr(C)]
