@@ -121,8 +121,7 @@ impl Ext2 {
                         return;
                     }
                     let block = 
-                        self.blocks[inode.direct_pointer[block_num as usize] as usize
-                                    - self.block_offset
+                        self.blocks[inode.direct_pointer[block_num as usize] as usize - self.block_offset
                                    ].as_ptr() as *const u8;
                     if block == std::ptr::null() {
                         return;
@@ -141,8 +140,7 @@ impl Ext2 {
                         if *indirect_pointer.offset(direct_block) == 0 {
                             return;
                         }
-                        self.blocks[*indirect_pointer.offset(direct_block) as usize 
-                                    - self.block_offset
+                        self.blocks[*indirect_pointer.offset(direct_block) as usize - self.block_offset
                                    ].as_ptr() as *const u8
                     };
                     if block == std::ptr::null() {
@@ -169,9 +167,8 @@ impl Ext2 {
                     }
                     for direct_block in 0..n_ptrs_in_block {
                         let block = unsafe{
-                            self.blocks[*indirect_pointer.offset(direct_block) as usize 
-                                        - self.block_offset
-                                        ].as_ptr() as *const u8
+                            self.blocks[*indirect_pointer.offset(direct_block) as usize - self.block_offset
+                                       ].as_ptr() as *const u8
                         };
                         if block == std::ptr::null() {
                             return;
