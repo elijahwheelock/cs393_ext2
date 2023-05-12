@@ -199,6 +199,7 @@ pub struct DirectoryEntry {
     pub name: NulStr,
 }
 
+#[allow(dead_code)]
 #[derive(Debug)]
 pub enum TypeIndicator {
     Unknown,

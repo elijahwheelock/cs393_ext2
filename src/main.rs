@@ -1,7 +1,6 @@
 #![feature(int_roundings)]
 #![feature(io_error_more)]
 #![feature(generators, generator_trait)]
-
 mod structs;
 use crate::structs::{
     BlockGroupDescriptor, 
@@ -18,15 +17,12 @@ use core::{
 use null_terminated::NulStr;
 use rustyline::{DefaultEditor, Result};
 use std::{
-    alloc::{
-        alloc_zeroed,
-        Layout,   
-    },
-    fmt,   
+ // fmt,   
     fs::File,
-    io::{Error,
-         ErrorKind::*,
-         prelude::*,
+    io::{
+        Error,
+        ErrorKind::*,
+        prelude::*,
     },
 };
 use uuid::Uuid;
@@ -106,7 +102,29 @@ impl Ext2 {
         }
     }
 
-    pub fn get_blocks_gen(&self, inode_num: usize)
+ // pub fn get_block(&self, block_num: u32) -> *mut [u8] {
+ //         self.blocks[block_num as usize - self.block_offset]
+ // }
+
+ // pub fn get_inode_next_block_num(&self, inode_num: usize) -> usize {
+ //     let inode = self.get_inode(inode_num);
+ //     let n_ptrs_in_block = (self.block_size / mem::size_of::<u32>()) as usize;
+ //     let block_num = inode.size() / n_ptrs_in_block as usize;
+ //     let max_indirect = 12 + n_ptrs_in_block;
+ //     let max_doubly = max_indirect + n_ptrs_in_block * n_ptrs_in_block;
+ //     if block_num < 12 {
+ //         inode.direct_pointer[block_num] as usize
+ //     }
+ //     else if block_num < max_indirect {
+ //         *(self.get_block(inode.indirect_pointer) as *const u32).offset((block_num % max_indirect) as isize) as usize
+ //     }
+ //     else if block_num < max_doubly {
+ //         
+ //     }
+ // }
+
+    // returns an iterator over all the blocks in inode which have content
+    pub fn get_inode_blocks(&self, inode_num: usize)
     -> GeneratorIteratorAdapter<impl Generator<Yield = *const u8, Return = ()> + '_>
     {
         GeneratorIteratorAdapter::new(
@@ -256,8 +274,36 @@ impl Ext2 {
         self.get_child_by_name(current_inode, &target.to_string())
     }
 
+    pub fn get_free_block_num(&self) -> Option<usize> {
+        for group in self.block_groups {
+            let block_usage_bitmap = &self.blocks[group.block_usage_addr as usize - self.block_offset];
+            for (i, byte) in block_usage_bitmap.iter().enumerate() {
+                for j in 0..8{
+                    if (byte & (1 << j)) == 1 {
+                        return Some(i * 8 + j);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    pub fn get_free_inode_num(&self) -> Option<usize> {
+        for group in self.block_groups {
+            let inode_usage_bitmap = &self.blocks[group.inode_usage_addr as usize - self.block_offset];
+            for (i, byte) in inode_usage_bitmap.iter().enumerate() {
+                for j in 0..8{
+                    if (byte & (1 << j)) == 1 {
+                        return Some(i * 8 + j);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     // given a (1-indexed) inode number, return that #'s inode structure
-    pub fn get_inode(&self, inode: usize) -> &'static mut Inode { // FIXME this kills the borrow checker
+    pub fn get_inode(&self, inode: usize) -> &'static mut Inode { // FIXME I'm fighting the borrow checker here, and losing
         let group: usize = (inode - 1) / self.superblock.inodes_per_group as usize;
         let index: usize = (inode - 1) % self.superblock.inodes_per_group as usize;
         // println!("in get_inode, inode num = {}, index = {}, group = {}", inode, index, group);
@@ -286,7 +332,7 @@ impl Ext2 {
         let mut ret = Vec::new();
         // println!("in read_dir_inode, #{} : {:?}", inode, root);
         // println!("following direct pointer to data block: {}", root.direct_pointer[0]);
-        let blocks = self.get_blocks_gen(inode);
+        let blocks = self.get_inode_blocks(inode);
         for block in blocks {
             let mut byte_offset: isize = 0;
             while byte_offset < (self.block_size as isize) {
@@ -329,7 +375,6 @@ impl Inode {
 // the following copied from 
 // https://stackoverflow.com/questions/16421033/lazy-sequence-generation-in-rust#30279122
 pub struct GeneratorIteratorAdapter<G>(Pin<Box<G>>);
-
 impl<G> GeneratorIteratorAdapter<G>
 where
     G: Generator<Return = ()>,
@@ -338,13 +383,11 @@ where
         Self(Box::pin(gen))
     }
 }
-
 impl<G> Iterator for GeneratorIteratorAdapter<G>
 where
     G: Generator<Return = ()>,
 {
     type Item = G::Yield;
-
     fn next(&mut self) -> Option<Self::Item> {
         match self.0.as_mut().resume(()) {
             GeneratorState::Yielded(x) => Some(x),
@@ -357,7 +400,7 @@ fn main() -> Result<()> {
     //let mut disk = include_bytes!("../myfs.ext2");
     let mut file = File::open("../myfs.ext2").unwrap();
     let mut v = Vec::new();
-    file.read_to_end(&mut v);
+    file.read_to_end(&mut v)?;
     let buf = v.as_mut_slice();
     let start_addr: usize = buf.as_ptr() as usize;
     let mut ext2 = Ext2::new(&buf[..], start_addr);
@@ -396,21 +439,14 @@ fn main() -> Result<()> {
                 let n_ptrs_in_block = ext2.block_size / mem::size_of::<u32>();
                 let (mut block_num, mut byte_offset) = (size / n_ptrs_in_block, size % n_ptrs_in_block);
                 let mut current_byte = 0;
-                let tmp = inode.direct_pointer[block_num] as usize;
                 while current_byte < b.len() && block_num < 12 {
-                    if tmp == 0 {
-                        unsafe {
-                            let p = alloc_zeroed(Layout::array::<u8>(ext2.block_size).unwrap());
-                            let slice = core::slice::from_raw_parts_mut(p, ext2.block_size);
-                            *inode.direct_pointer.as_mut_ptr().offset(block_num as isize) = ext2.blocks.len() as u32;
-                            ext2.blocks.push(slice);
-                            // TODO possibly need to make a new block group, but the given definition for the Ext2
-                            //      struct doesn't allow adding block groups, for now so I'm assuming that's outside
-                            //      the scope of this project.
-                        }
+                    let tmp = inode.direct_pointer[block_num] as usize;
+                    if inode.direct_pointer[block_num] as usize == 0 {
+                        let new_block_num = ext2.get_free_block_num();
+                        inode.direct_pointer[block_num] = new_block_num.unwrap() as u32;
                     }
                     else {
-                        let current_block = &mut ext2.blocks[tmp - ext2.block_offset];
+                        let current_block = &mut ext2.blocks[inode.direct_pointer[block_num] as usize - ext2.block_offset];
                         if byte_offset > 0 {
                             byte_offset -= 1
                         }
@@ -437,7 +473,7 @@ fn main() -> Result<()> {
                 };
                 if !ext2.is_directory(inode_num) {
                     unsafe {
-                        let blocks_gen = ext2.get_blocks_gen(inode_num);
+                        let blocks_gen = ext2.get_inode_blocks(inode_num);
                         for block in blocks_gen {
                             for i in 0..ext2.block_size as isize {
                                 print!("{}", *block.offset(i) as char);
